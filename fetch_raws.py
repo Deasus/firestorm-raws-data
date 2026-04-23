@@ -1,34 +1,27 @@
 """
-FIRESTORM RAWS / FEMS Pipeline — v1 (Phase 1 + Phase 2)
-========================================================
-Pulls Remote Automated Weather Station (RAWS) metadata and latest
-observations from the US federal Fire Environment Mapping System (FEMS),
-the authoritative source for NFDRS.
+FIRESTORM RAWS / FEMS Pipeline — v2 (real GraphQL schema)
+==========================================================
+Pulls RAWS station metadata and recent weather observations from
+the US federal Fire Environment Mapping System (FEMS) via its
+GraphQL API.
 
-Data source: https://fems.fs2c.usda.gov/api/ext-climatology/*
-Public endpoints — no auth required for recent observations.
+Endpoint: https://fems.fs2c.usda.gov/api/climatology/graphql/
+Auth:     Public (no key required for station metadata + recent obs)
+Schema confirmed by devtools inspection of FEMS UI, April 23 2026.
 
 Outputs:
-  data/raws-stations.json  — full list of stations (metadata, lat/lng, elevation)
+  data/raws-stations.json  — all stations (metadata, lat/lng, elevation, agency)
   data/raws-latest.json    — latest observation per station (hourly)
-  data/meta.json           — pipeline metadata (counts, timestamps, raw counts)
-
-Designed to FAIL LOUDLY if endpoint paths change, rather than silently
-return empty results. Every source is logged with response code and
-byte count so issues are easy to diagnose.
-
-Phases:
-  Phase 1 (this script): station list + current weather observations
-  Phase 2 (this script): last 24h observations per station for sparklines
-  Phase 3 (future):      add NFDRS indices (BI, ERC, SC) with color-coding
-  Phase 4 (future):      Live Fuel Moisture historical trace
-  Phase 5 (future):      Gridded FEMS NFDRS outputs as base heatmap
+  data/meta.json           — pipeline metadata
 
 Schedule: GitHub Actions cron, every 1 hour.
 
-NOTE: This is v1 — exact FEMS API endpoint paths are best-effort based
-on partial public documentation. The script tries the most-likely
-candidates and logs which one works. Expect iteration after first run.
+Implementation notes:
+- FEMS uses GraphQL with REST-style pagination metadata in responses
+- stationIds is string-typed despite station_id being integer in responses
+- returnAll:true returns every public station (no auth required for public set)
+- weatherObs query accepts a single stationId string; we loop across stations
+  with polite delays to avoid hammering FEMS
 """
 
 import json
@@ -36,334 +29,347 @@ import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote, urlencode
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ── FEMS API base URLs to try ──────────────────────────────────────
-# Listed in order of likelihood based on the confirmed ext-climatology
-# endpoint pattern. First success wins.
-FEMS_BASE = "https://fems.fs2c.usda.gov"
+# ── FEMS API ─────────────────────────────────────────────────────────
+FEMS_GRAPHQL = "https://fems.fs2c.usda.gov/api/climatology/graphql/"
 
-# Station list endpoint candidates
-STATION_LIST_CANDIDATES = [
-    f"{FEMS_BASE}/api/ext-climatology/stations",
-    f"{FEMS_BASE}/api/ext-station/list",
-    f"{FEMS_BASE}/api/stations",
-    f"{FEMS_BASE}/api/ext-stations",
-    f"{FEMS_BASE}/api/ext-raws/stations",
-]
+# Polite rate: delay every N requests. FEMS is public but we should
+# be respectful — this pipeline pulls ~2,000 stations hourly.
+REQUEST_BATCH_SIZE = 25
+INTER_BATCH_DELAY = 0.5  # seconds between batches
 
-# Hourly weather observations endpoint candidates
-# Format inferred from confirmed download-nfdr pattern
-WEATHER_DOWNLOAD_BASE = f"{FEMS_BASE}/api/ext-climatology/download-weather"
-NFDR_DOWNLOAD_BASE = f"{FEMS_BASE}/api/ext-climatology/download-nfdr"
+# ── GraphQL queries — copied verbatim from FEMS UI (devtools inspection) ──
 
-# ── HTTP helpers ───────────────────────────────────────────────────
+STATION_LIST_QUERY = """
+query GetAllStations(
+    $hasHistoricData: TriState
+    $weatherHourlyVisible: TriState
+) {
+    stationMetaData(
+        returnAll: true
+        weatherHourlyVisible: $weatherHourlyVisible
+        hasHistoricData: $hasHistoricData
+    ) {
+        _metadata {
+            page
+            per_page
+            total_count
+            page_count
+        }
+        data {
+            station_id
+            fems_station_id
+            network_name
+            network_id
+            wrcc_id
+            state
+            has_historic_data
+            period_record_start
+            period_record_stop
+            time_zone
+            time_zone_offset
+            station_name
+            latitude
+            longitude
+            aspect_direction
+            elevation
+            avg_annual_precip
+            agency
+            weather_hourly_visible
+            nfdrs_hourly_visible
+            produce_nfdrs
+        }
+    }
+}
+"""
 
-def _req(url, description, timeout=30):
-    """Wrapper around requests.get with uniform logging."""
+WEATHER_OBS_QUERY = """
+query GetWeatherObs(
+    $stationId: String!
+    $startDate: String
+    $endDate: String
+) {
+    weatherObs(
+        stationIds: $stationId
+        startDate: $startDate
+        endDate: $endDate
+    ) {
+        _metadata {
+            page
+            per_page
+            total_count
+            page_count
+        }
+        data {
+            station_id
+            observation_time
+            observation_time_lst
+            temperature
+            hourly_precip
+            relative_humidity
+            wind_speed
+            wind_direction
+            peak_gust_speed
+            peak_gust_dir
+            sol_rad
+            snow_flag
+            observation_type
+        }
+    }
+}
+"""
+
+
+# ── HTTP helper ──────────────────────────────────────────────────────
+
+def gql_request(query, variables, description, timeout=60):
+    """
+    Fire a single GraphQL request against FEMS. Returns parsed JSON
+    body or None on failure. Logs full diagnostic on every call.
+    """
     import requests
+    payload = {"query": query, "variables": variables}
     try:
-        resp = requests.get(url, timeout=timeout, headers={
-            "User-Agent": "FIRESTORM-RAWS-Pipeline/1.0",
-            "Accept": "application/json, */*",
-        })
+        resp = requests.post(
+            FEMS_GRAPHQL,
+            json=payload,
+            timeout=timeout,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "FIRESTORM-RAWS-Pipeline/2.0",
+                "Origin": "https://fems.fs2c.usda.gov",
+                "Referer": "https://fems.fs2c.usda.gov/ui",
+            },
+        )
         ct = resp.headers.get("content-type", "")
         print(f"  {description}: HTTP {resp.status_code}, "
               f"{len(resp.content)} bytes, type: {ct[:40]}")
-        return resp
+        if resp.status_code != 200:
+            print(f"    Body preview: {resp.text[:300]}")
+            return None
+        return resp.json()
     except Exception as e:
         print(f"  {description}: EXCEPTION — {e}")
         return None
 
 
-def _try_json(resp):
-    """Best-effort JSON parse. Returns None on failure."""
-    if resp is None or resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
-    except Exception as e:
-        # Sometimes endpoint returns CSV even when we want JSON
-        text = resp.text[:200]
-        print(f"    JSON parse failed: {e}. First 200 chars: {text!r}")
-        return None
+# ── Phase 1: Station metadata ────────────────────────────────────────
 
+def fetch_all_stations():
+    """Pull the complete station list from FEMS."""
+    print("\n[STATIONS] Fetching full RAWS station metadata from FEMS...")
 
-# ── Phase 1: Station metadata ──────────────────────────────────────
+    result = gql_request(
+        STATION_LIST_QUERY,
+        {
+            "hasHistoricData": "ALL",
+            "weatherHourlyVisible": "ALL",
+        },
+        description="All-stations query",
+    )
 
-def fetch_station_list():
-    """
-    Fetch the full RAWS station list from FEMS.
-    Returns a list of dicts with at least: stationId, name, lat, lng, elevation.
+    if not result or "data" not in result:
+        print("  No data key in response — aborting.")
+        return []
 
-    Tries multiple candidate endpoint paths and returns the first one that
-    yields a recognizable station array. Logs every attempt.
-    """
-    print("\n[STATIONS] Fetching RAWS station metadata from FEMS...")
+    errors = result.get("errors")
+    if errors:
+        print(f"  GraphQL errors: {json.dumps(errors)[:500]}")
+        return []
 
-    for candidate_url in STATION_LIST_CANDIDATES:
-        print(f"  Trying: {candidate_url}")
-        resp = _req(candidate_url, description="  Response")
-        if resp is None or resp.status_code != 200:
+    payload = result.get("data", {}).get("stationMetaData", {})
+    metadata = payload.get("_metadata", {})
+    stations_raw = payload.get("data", []) or []
+
+    print(f"  Total reported: {metadata.get('total_count')}, "
+          f"returned: {len(stations_raw)}")
+
+    stations = []
+    for s in stations_raw:
+        sid = s.get("station_id")
+        lat = s.get("latitude")
+        lng = s.get("longitude")
+        if sid is None or lat is None or lng is None:
+            continue
+        try:
+            stations.append({
+                "stationId": str(sid),
+                "femsStationId": s.get("fems_station_id"),
+                "wrccId": s.get("wrcc_id"),
+                "name": s.get("station_name") or f"Station {sid}",
+                "state": s.get("state"),
+                "lat": float(lat),
+                "lng": float(lng),
+                "elevation": s.get("elevation"),
+                "agency": s.get("agency") or "",
+                "network": s.get("network_name"),
+                "timeZone": s.get("time_zone"),
+                "timeZoneOffset": s.get("time_zone_offset"),
+                "hasHistoric": bool(s.get("has_historic_data")),
+                "weatherHourly": bool(s.get("weather_hourly_visible")),
+                "nfdrsHourly": bool(s.get("nfdrs_hourly_visible")),
+                "produceNfdrs": bool(s.get("produce_nfdrs")),
+            })
+        except (ValueError, TypeError) as e:
+            print(f"  Skipping malformed station record (id={sid}): {e}")
             continue
 
-        data = _try_json(resp)
-        if not data:
-            continue
-
-        # FEMS might return the station array directly, OR wrapped in
-        # a 'data', 'stations', 'items', or 'results' key. Handle both.
-        stations_raw = None
-        if isinstance(data, list):
-            stations_raw = data
-        elif isinstance(data, dict):
-            for key in ["stations", "data", "items", "results", "features"]:
-                if key in data and isinstance(data[key], list):
-                    stations_raw = data[key]
-                    print(f"  Station array found under key '{key}'")
-                    break
-
-        if not stations_raw:
-            print(f"  JSON parsed but no recognizable station array. "
-                  f"Top-level keys: {list(data.keys())[:10] if isinstance(data, dict) else '(list)'}")
-            continue
-
-        # Normalize field names — FEMS may use camelCase, snake_case, or
-        # abbreviated keys depending on API version. Try several.
-        stations = []
-        for s in stations_raw:
-            if not isinstance(s, dict):
-                continue
-            station_id = (s.get("stationId") or s.get("station_id")
-                          or s.get("id") or s.get("nwsId") or s.get("nwsid"))
-            name = (s.get("stationName") or s.get("name")
-                    or s.get("station_name") or s.get("displayName"))
-            lat = (s.get("latitude") or s.get("lat") or s.get("y"))
-            lng = (s.get("longitude") or s.get("lon") or s.get("lng")
-                   or s.get("long") or s.get("x"))
-            elev = (s.get("elevation") or s.get("elev")
-                    or s.get("elevationFeet") or s.get("height"))
-            agency = (s.get("agency") or s.get("owner")
-                      or s.get("ownerAgency") or s.get("operator"))
-            active = s.get("active", True)
-
-            # Skip records missing essentials
-            if station_id is None or lat is None or lng is None:
-                continue
-            # GeoJSON features have geometry.coordinates — try that
-            if "geometry" in s and isinstance(s["geometry"], dict):
-                coords = s["geometry"].get("coordinates", [])
-                if len(coords) >= 2:
-                    lng, lat = coords[0], coords[1]
-
-            try:
-                stations.append({
-                    "stationId": str(station_id),
-                    "name": name or f"Station {station_id}",
-                    "lat": float(lat),
-                    "lng": float(lng),
-                    "elevation": int(elev) if elev is not None else None,
-                    "agency": agency or "",
-                    "active": bool(active),
-                })
-            except (ValueError, TypeError) as e:
-                print(f"  Skipping bad station record (id={station_id}): {e}")
-                continue
-
-        if stations:
-            print(f"  ✓ Parsed {len(stations)} stations from {candidate_url}")
-            return stations
-
-    print("  ALL STATION ENDPOINT CANDIDATES FAILED.")
-    print("  This pipeline needs the correct endpoint path.")
-    print("  Visit https://fems.fs2c.usda.gov/ and inspect devtools → Network")
-    print("  to find the actual station list URL, then update STATION_LIST_CANDIDATES.")
-    return []
+    print(f"  ✓ Parsed {len(stations)} valid stations")
+    return stations
 
 
-# ── Phase 2: Latest observations per station ───────────────────────
+# ── Phase 2: Latest observation per station ──────────────────────────
 
-def fetch_latest_weather(stations, batch_size=50):
+def fetch_latest_observations(stations):
     """
-    Pull the most recent weather observation for each station.
+    Query recent hourly observations per station, keep only the most
+    recent non-forecast record.
 
-    Strategy: FEMS confirmed endpoint is download-weather with stationIds
-    param (comma-separated) + date range. We pull last 24h so we can
-    find the most recent non-null observation per station.
-
-    Returns: dict keyed by stationId → latest obs dict.
+    FEMS returns forecasts (observation_type='F') interleaved with
+    observed values (observation_type='O'). For a "current conditions"
+    view, prefer 'O' over 'F'. Fall back to 'F' only if a station has
+    no recent observed data (typical for outages or reporting lag).
     """
-    print("\n[WEATHER] Fetching latest observations for all stations...")
+    print(f"\n[WEATHER] Fetching latest obs for {len(stations)} stations...")
 
-    if not stations:
-        print("  No stations — skipping.")
-        return {}
-
-    # Request a 24h window to ensure we catch each station's most recent obs
     end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(hours=24)
-    end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_dt = end_dt - timedelta(hours=6)
+    end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    active_stations = [s for s in stations if s.get("weatherHourly")]
+    print(f"  Active hourly-weather stations: {len(active_stations)}")
 
     latest_by_station = {}
-    num_batches = (len(stations) + batch_size - 1) // batch_size
+    total = len(active_stations)
+    t_start = time.time()
 
-    for batch_idx in range(num_batches):
-        batch = stations[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-        station_ids = ",".join(s["stationId"] for s in batch)
+    for i, station in enumerate(active_stations):
+        sid = station["stationId"]
 
-        params = {
-            "stationIds": station_ids,
-            "startDate": start_str,
-            "endDate": end_str,
-            "dataFormat": "json",
-            "dataset": "all",
-            "dateTimeFormat": "UTC",
-        }
-        url = f"{WEATHER_DOWNLOAD_BASE}?{urlencode(params)}"
+        if i > 0 and i % REQUEST_BATCH_SIZE == 0:
+            elapsed = time.time() - t_start
+            eta = (elapsed / i) * (total - i) if i else 0
+            print(f"  [{i}/{total}] elapsed {elapsed:.0f}s, eta {eta:.0f}s, "
+                  f"got {len(latest_by_station)} obs so far")
+            time.sleep(INTER_BATCH_DELAY)
 
-        # Brief polite delay between batches
-        if batch_idx > 0:
-            time.sleep(1.0)
+        result = gql_request(
+            WEATHER_OBS_QUERY,
+            {
+                "stationId": sid,
+                "startDate": start_str,
+                "endDate": end_str,
+            },
+            description=f"  Station {sid}",
+            timeout=30,
+        )
 
-        resp = _req(url, f"Batch {batch_idx+1}/{num_batches} ({len(batch)} stations)")
-        if resp is None or resp.status_code != 200:
+        if not result:
             continue
+        payload = result.get("data", {}).get("weatherObs")
+        if not payload:
+            continue
+        records = payload.get("data", []) or []
 
-        data = _try_json(resp)
-        if not data:
-            # Try CSV fallback — some FEMS endpoints return CSV by default
-            print(f"  Attempting CSV parse for batch {batch_idx+1}...")
-            records = _parse_weather_csv(resp.text)
-        else:
-            records = data if isinstance(data, list) else data.get("data", [])
+        observed = [r for r in records if r.get("observation_type") == "O"]
+        pool = observed if observed else records
+        if not pool:
+            continue
+        latest = max(pool, key=lambda r: r.get("observation_time", ""))
 
-        # Group observations by station, keep most recent per station
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            sid = str(rec.get("stationId") or rec.get("station_id")
-                      or rec.get("stationID") or "")
-            obs_time = (rec.get("observationTime") or rec.get("observation_time")
-                        or rec.get("obsTime") or rec.get("time"))
-            if not sid or not obs_time:
-                continue
-            # Keep only the most recent
-            if sid not in latest_by_station or obs_time > latest_by_station[sid].get("observationTime", ""):
-                latest_by_station[sid] = {
-                    "stationId": sid,
-                    "observationTime": obs_time,
-                    "tempF": _f(rec.get("temperature") or rec.get("temp_f") or rec.get("tempF")),
-                    "rhPct": _f(rec.get("relativeHumidity") or rec.get("rh") or rec.get("rhPct")),
-                    "windSpeedMph": _f(rec.get("windSpeed") or rec.get("wind_speed") or rec.get("windSpeedMph")),
-                    "windDirDeg": _f(rec.get("windDirection") or rec.get("wind_dir") or rec.get("windDirDeg")),
-                    "windGustMph": _f(rec.get("windGust") or rec.get("gust") or rec.get("windGustMph")),
-                    "precipIn": _f(rec.get("precipitation") or rec.get("precip") or rec.get("precipIn")),
-                    "solarRad": _f(rec.get("solarRadiation") or rec.get("solar_rad") or rec.get("solarRad")),
-                }
+        latest_by_station[sid] = {
+            "stationId": sid,
+            "observationTime": latest.get("observation_time"),
+            "observationTimeLst": latest.get("observation_time_lst"),
+            "tempF": latest.get("temperature"),
+            "rhPct": latest.get("relative_humidity"),
+            "windSpeedMph": latest.get("wind_speed"),
+            "windDirDeg": latest.get("wind_direction"),
+            "windGustMph": latest.get("peak_gust_speed"),
+            "precipIn": latest.get("hourly_precip"),
+            "solarRad": latest.get("sol_rad"),
+            "snowFlag": latest.get("snow_flag"),
+            "observationType": latest.get("observation_type"),
+        }
 
-    print(f"  ✓ Got latest obs for {len(latest_by_station)}/{len(stations)} stations")
+    elapsed = time.time() - t_start
+    print(f"  ✓ Got latest obs for {len(latest_by_station)}/{total} "
+          f"stations in {elapsed:.0f}s")
     return latest_by_station
 
 
-def _f(val):
-    """Safe float conversion. Returns None on failure/missing."""
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_weather_csv(text):
-    """Minimal CSV fallback parser. Handles basic comma-separated rows."""
-    import csv
-    from io import StringIO
-    records = []
-    try:
-        reader = csv.DictReader(StringIO(text))
-        for row in reader:
-            records.append(dict(row))
-    except Exception as e:
-        print(f"    CSV parse failed: {e}")
-    return records
-
-
-# ── Main orchestration ─────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("FIRESTORM RAWS Pipeline v1 (FEMS)")
+    print("FIRESTORM RAWS Pipeline v2 (FEMS GraphQL)")
     print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
 
-    stations = fetch_station_list()
+    stations = fetch_all_stations()
     if not stations:
-        print("\nABORT: No stations retrieved. See candidate-URL failures above.")
+        print("\nABORT: No stations retrieved.")
         sys.exit(1)
 
-    latest_obs = fetch_latest_weather(stations)
+    latest_obs = fetch_latest_observations(stations)
 
-    # Merge latest observations INTO the station records so frontend
-    # can consume one unified JSON per station (lighter payload than
-    # two parallel lookups).
+    # Embed latest obs into station records for single-file consumption
     for s in stations:
         s["latestObs"] = latest_obs.get(s["stationId"])
 
-    # Write stations file
+    # Write full stations file
     stations_path = os.path.join(DATA_DIR, "raws-stations.json")
     with open(stations_path, "w") as f:
         json.dump({
             "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "schema_version": 1,
+            "schema_version": 2,
             "count": len(stations),
             "stations": stations,
         }, f, separators=(",", ":"))
     size_kb = os.path.getsize(stations_path) / 1024
-    print(f"\n[OUTPUT] {stations_path} ({size_kb:.0f} KB, {len(stations)} stations)")
+    print(f"\n[OUTPUT] {stations_path} ({size_kb:.0f} KB)")
 
-    # Write latest-only file for smaller frontend payload if needed
+    # Observations-only file (smaller, for future frequent-refresh use)
     latest_path = os.path.join(DATA_DIR, "raws-latest.json")
     with open(latest_path, "w") as f:
         json.dump({
             "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "schema_version": 1,
+            "schema_version": 2,
             "count": len(latest_obs),
             "observations": latest_obs,
         }, f, separators=(",", ":"))
-    print(f"[OUTPUT] {latest_path} ({os.path.getsize(latest_path)/1024:.0f} KB, "
-          f"{len(latest_obs)} recent observations)")
+    print(f"[OUTPUT] {latest_path} "
+          f"({os.path.getsize(latest_path)/1024:.0f} KB)")
 
-    # Metadata file
     meta = {
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "schema_version": 1,
+        "schema_version": 2,
         "counts": {
             "stations_total": len(stations),
+            "stations_with_hourly": sum(1 for s in stations if s.get("weatherHourly")),
             "stations_with_latest_obs": len(latest_obs),
-            "stations_stale": len(stations) - len(latest_obs),
+            "stations_with_nfdrs": sum(1 for s in stations if s.get("produceNfdrs")),
         },
         "sources": {
-            "fems_api": FEMS_BASE,
-            "weather_download": WEATHER_DOWNLOAD_BASE,
-            "nfdr_download": NFDR_DOWNLOAD_BASE,
+            "fems_graphql": FEMS_GRAPHQL,
         },
         "phase": "Phase 1+2 (stations + latest obs). "
-                 "Phase 3 (NFDRS indices) and Phase 4 (LFM) not yet implemented.",
+                 "Phase 3 (NFDRS indices) not yet implemented.",
     }
-    meta_path = os.path.join(DATA_DIR, "meta.json")
-    with open(meta_path, "w") as f:
+    with open(os.path.join(DATA_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"[OUTPUT] {meta_path}")
+    print(f"[OUTPUT] data/meta.json")
 
     print(f"\n{'='*60}")
     print(f"Total stations: {len(stations)}")
-    print(f"With recent obs: {len(latest_obs)} "
-          f"({100*len(latest_obs)//max(len(stations),1)}%)")
+    print(f"  With hourly weather: {meta['counts']['stations_with_hourly']}")
+    print(f"  With recent obs:     {len(latest_obs)}")
+    print(f"  With NFDRS output:   {meta['counts']['stations_with_nfdrs']}")
     print("Done!")
 
 
