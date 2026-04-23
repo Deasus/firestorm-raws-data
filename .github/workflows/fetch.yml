@@ -1,0 +1,32 @@
+name: Update RAWS Station Data (FEMS)
+on:
+  schedule:
+    - cron: '15 * * * *'   # Every hour at :15 (offset from other pipelines)
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  update-raws:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Fetch RAWS data from FEMS
+        run: python fetch_raws.py
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git reset --soft origin/main
+          git add -A data/
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          git commit -m "Update RAWS data — ${TIMESTAMP}" --allow-empty
+          git push
