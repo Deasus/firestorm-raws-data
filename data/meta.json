@@ -1,0 +1,14 @@
+{
+  "updated": "2026-04-23T15:30:37Z",
+  "schema_version": 2,
+  "counts": {
+    "stations_total": 3397,
+    "stations_with_hourly": 2914,
+    "stations_with_latest_obs": 0,
+    "stations_with_nfdrs": 3397
+  },
+  "sources": {
+    "fems_graphql": "https://fems.fs2c.usda.gov/api/climatology/graphql/"
+  },
+  "phase": "Phase 1+2 (stations + latest obs). Phase 3 (NFDRS indices) not yet implemented."
+}
